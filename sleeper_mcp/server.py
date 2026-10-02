@@ -1919,11 +1919,33 @@ def main():
         # Pre-load player DB before serving requests
         asyncio.run(_warmup())
 
-        # Add /health endpoint so Railway's health check returns 200
+        # Add /health + /debug endpoints
         async def _health(request: Request) -> JSONResponse:
-            return JSONResponse({"status": "ok", "service": "sleeper-mcp"})
+            import subprocess, time
+            try:
+                commit = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
+            except Exception:
+                commit = "unknown"
+            return JSONResponse({"status": "ok", "service": "sleeper-mcp", "commit": commit, "ts": int(time.time())})
 
-        mcp._get_additional_http_routes = lambda: [Route("/health", _health)]
+        async def _debug(request: Request) -> JSONResponse:
+            import traceback as tb
+            results = {}
+            try:
+                user = await client.get_user("chriscringle19")
+                results["get_user"] = str(user)[:100] if user else "NULL"
+            except Exception as e:
+                results["get_user_err"] = tb.format_exc()[-200:]
+            try:
+                state = await client.get_nfl_state()
+                results["nfl_state_week"] = state.get("week")
+            except Exception as e:
+                results["nfl_state_err"] = str(e)
+            from sleeper_mcp.cache import load_context
+            results["cached_ctx"] = str(load_context())
+            return JSONResponse(results)
+
+        mcp._get_additional_http_routes = lambda: [Route("/health", _health), Route("/debug", _debug)]
 
         port = int(os.getenv("PORT", "8000"))
         mcp.run(transport="http", host="0.0.0.0", port=port)
