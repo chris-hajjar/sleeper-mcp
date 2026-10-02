@@ -149,10 +149,30 @@ class SleeperClient:
             params["position[]"] = positions
         return await self.get(f"/projections/nfl/player/{week}", params=params)
 
+    # ── REST stats map (public, no auth needed) ───────────────────────────────
+
+    async def get_player_stats_map(self, week: int, season: str = "2026") -> dict:
+        """
+        Returns {player_id: stats_dict} via the public REST endpoint.
+        Works from any IP without auth. Used as fallback when GQL returns 401.
+        """
+        cache_key = f"rest_{season}_{week}"
+        if cache_key in _week_stats_cache:
+            return _week_stats_cache[cache_key]
+        stats_list = await self.get_player_stats(week, season)
+        by_player = {str(s["player_id"]): s for s in stats_list if "player_id" in s}
+        _week_stats_cache[cache_key] = by_player
+        return by_player
+
     # ── GraphQL (internal Sleeper API) ────────────────────────────────────────
 
     async def graphql(self, query: str, variables: Optional[dict] = None) -> dict:
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Origin": "https://sleeper.com",
+            "Referer": "https://sleeper.com/",
+        }
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         payload: dict = {"query": query}
@@ -166,33 +186,36 @@ class SleeperClient:
     async def get_week_player_stats(self, week: int, season: str = "2026") -> dict:
         """
         Returns {player_id: stats_dict} for all players in a week.
-        Includes pre-calculated pts_ppr, pts_std, pts_half_ppr.
-        Uses in-memory cache (cleared on new week).
+        Tries GQL first; falls back to REST on auth failure.
         """
         cache_key = f"{season}_{week}"
         if cache_key in _week_stats_cache:
             return _week_stats_cache[cache_key]
 
-        result = await self.graphql("""
-        query WeeklyStats($season: String!, $week: Int!, $season_type: String!) {
-          weekly_stats(
-            sport: "nfl"
-            season: $season
-            season_type: $season_type
-            week: $week
-            category: "stat"
-            order_by: "pts_ppr"
-          ) {
-            player_id
-            stats
-            week
-          }
-        }
-        """, {"season": season, "week": week, "season_type": "regular"})
+        try:
+            result = await self.graphql("""
+            query WeeklyStats($season: String!, $week: Int!, $season_type: String!) {
+              weekly_stats(
+                sport: "nfl"
+                season: $season
+                season_type: $season_type
+                week: $week
+                category: "stat"
+                order_by: "pts_ppr"
+              ) {
+                player_id
+                stats
+                week
+              }
+            }
+            """, {"season": season, "week": week, "season_type": "regular"})
 
-        data = result.get("data") or {}
-        rows = data.get("weekly_stats") or []
-        by_player = {row["player_id"]: row.get("stats") or {} for row in rows}
+            data = result.get("data") or {}
+            rows = data.get("weekly_stats") or []
+            by_player = {row["player_id"]: row.get("stats") or {} for row in rows}
+        except Exception:
+            by_player = await self.get_player_stats_map(week, season)
+
         _week_stats_cache[cache_key] = by_player
         return by_player
 
@@ -203,28 +226,32 @@ class SleeperClient:
         season: str = "2026",
     ) -> dict:
         """
-        Returns {player_id: stats_dict} for a specific set of players in a week.
-        Faster than get_week_player_stats when you only need a few players.
+        Returns {player_id: stats_dict} for specific players in a week.
+        Tries GQL first; falls back to REST on auth failure.
         """
-        ids_gql = json.dumps(player_ids)
-        result = await self.graphql(f"""
-        query {{
-          stats_for_players_in_week(
-            player_ids: {ids_gql}
-            week: {week}
-            season: "{season}"
-            season_type: "regular"
-            sport: "nfl"
-            category: "stat"
-          ) {{
-            player_id
-            stats
-          }}
-        }}
-        """)
-        data = result.get("data") or {}
-        rows = data.get("stats_for_players_in_week") or []
-        return {row["player_id"]: row.get("stats") or {} for row in rows}
+        try:
+            ids_gql = json.dumps(player_ids)
+            result = await self.graphql(f"""
+            query {{
+              stats_for_players_in_week(
+                player_ids: {ids_gql}
+                week: {week}
+                season: "{season}"
+                season_type: "regular"
+                sport: "nfl"
+                category: "stat"
+              ) {{
+                player_id
+                stats
+              }}
+            }}
+            """)
+            data = result.get("data") or {}
+            rows = data.get("stats_for_players_in_week") or []
+            return {row["player_id"]: row.get("stats") or {} for row in rows}
+        except Exception:
+            all_stats = await self.get_player_stats_map(week, season)
+            return {pid: all_stats[pid] for pid in [str(p) for p in player_ids] if pid in all_stats}
 
     async def get_matchup_player_map(self, league_id: str, week: int) -> dict:
         """
