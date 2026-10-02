@@ -703,7 +703,11 @@ async def get_player_season_stats(name: str) -> str:
     Shows cumulative rushing, receiving, passing stats and scoring rank.
     """
     cur_week, season = await _current_week()
-    players = await client.get_players()
+    players, season_map = await _gather(
+        client.get_players(),
+        client.get_season_stats_map(season),
+    )
+
     result = _find_player(name, players)
     if not result:
         return f"Player '{name}' not found."
@@ -713,37 +717,14 @@ async def get_player_season_stats(name: str) -> str:
     pos = p.get("position", "?")
     team = p.get("team") or "FA"
 
-    # Gather weekly stats for all completed weeks concurrently
-    import asyncio
-    completed_weeks = range(1, cur_week)
-    if not completed_weeks:
-        return f"No completed weeks yet."
-
-    weekly = await asyncio.gather(
-        *[client.get_stats_for_players([pid], w, season) for w in completed_weeks],
-        return_exceptions=True,
-    )
-
-    totals: dict = {}
-    games_played = 0
-    for week_data in weekly:
-        if isinstance(week_data, Exception):
-            continue
-        stats = week_data.get(pid) or week_data.get(str(pid)) or {}
-        if not stats:
-            continue
-        if stats.get("gp", 0):
-            games_played += 1
-        for k, v in stats.items():
-            if isinstance(v, (int, float)) and not k.startswith("pos_rank"):
-                totals[k] = totals.get(k, 0) + (v or 0)
-
-    if not totals:
+    totals = season_map.get(str(pid)) or {}
+    if not totals or not totals.get("pts_ppr"):
         return f"{full_name} — no stats found for {season} season."
 
-    pts_ppr = totals.get("pts_ppr", 0)
-    pts_std = totals.get("pts_std", 0)
-    pts_half = totals.get("pts_half_ppr", 0)
+    games_played = int(totals.get("gp", 0) or 0)
+    pts_ppr = totals.get("pts_ppr", 0) or 0
+    pts_std = totals.get("pts_std", 0) or 0
+    pts_half = totals.get("pts_half_ppr", 0) or 0
     ppg_ppr = pts_ppr / games_played if games_played else 0
 
     lines = [
@@ -753,27 +734,27 @@ async def get_player_season_stats(name: str) -> str:
         "=" * 44,
     ]
 
-    pass_att = totals.get("pass_att", 0)
+    pass_att = totals.get("pass_att", 0) or 0
     if pass_att:
-        pass_cmp = totals.get("pass_cmp", 0)
-        pass_yd = totals.get("pass_yd", 0)
-        pass_td = int(totals.get("pass_td", 0))
-        pass_int = int(totals.get("pass_int", 0))
+        pass_cmp = totals.get("pass_cmp", 0) or 0
+        pass_yd = totals.get("pass_yd", 0) or 0
+        pass_td = int(totals.get("pass_td", 0) or 0)
+        pass_int = int(totals.get("pass_int", 0) or 0)
         cmp_pct = (pass_cmp / pass_att * 100) if pass_att else 0
         lines.append(f"Passing: {pass_cmp:.0f}/{pass_att:.0f} ({cmp_pct:.1f}%)  {pass_yd:.0f} yds  {pass_td} TD  {pass_int} INT")
 
-    rush_att = totals.get("rush_att", 0)
+    rush_att = totals.get("rush_att", 0) or 0
     if rush_att:
-        rush_yd = totals.get("rush_yd", 0)
-        rush_td = int(totals.get("rush_td", 0))
+        rush_yd = totals.get("rush_yd", 0) or 0
+        rush_td = int(totals.get("rush_td", 0) or 0)
         rush_ypa = rush_yd / rush_att if rush_att else 0
         lines.append(f"Rushing: {rush_att:.0f} att  {rush_yd:.0f} yds  {rush_td} TD  YPA: {rush_ypa:.1f}")
 
-    rec = totals.get("rec", 0)
+    rec = totals.get("rec", 0) or 0
     if rec or totals.get("rec_tgt", 0):
-        rec_tgt = totals.get("rec_tgt", 0)
-        rec_yd = totals.get("rec_yd", 0)
-        rec_td = int(totals.get("rec_td", 0))
+        rec_tgt = totals.get("rec_tgt", 0) or 0
+        rec_yd = totals.get("rec_yd", 0) or 0
+        rec_td = int(totals.get("rec_td", 0) or 0)
         rec_ypr = rec_yd / rec if rec else 0
         lines.append(f"Receiving: {rec:.0f} rec / {rec_tgt:.0f} tgt  {rec_yd:.0f} yds  {rec_td} TD  YPR: {rec_ypr:.1f}")
 
@@ -1915,9 +1896,36 @@ async def get_playoff_bracket() -> str:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 
+async def _warmup() -> None:
+    """Pre-load player DB and season stats so first user request is fast."""
+    try:
+        import asyncio
+        await asyncio.gather(
+            client.get_players(),
+            client.get_nfl_state(),
+            return_exceptions=True,
+        )
+    except Exception:
+        pass
+
+
 def main():
     transport = os.getenv("MCP_TRANSPORT", "stdio")
     if transport == "http":
+        import asyncio
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse
+        from starlette.routing import Route
+
+        # Pre-load player DB before serving requests
+        asyncio.run(_warmup())
+
+        # Add /health endpoint so Railway's health check returns 200
+        async def _health(request: Request) -> JSONResponse:
+            return JSONResponse({"status": "ok", "service": "sleeper-mcp"})
+
+        mcp._get_additional_http_routes = lambda: [Route("/health", _health)]
+
         port = int(os.getenv("PORT", "8000"))
         mcp.run(transport="http", host="0.0.0.0", port=port)
     else:
