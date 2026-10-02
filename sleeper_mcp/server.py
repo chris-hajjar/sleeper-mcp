@@ -1897,16 +1897,14 @@ async def get_playoff_bracket() -> str:
 
 
 async def _warmup() -> None:
-    """Pre-load player DB and season stats so first user request is fast."""
-    try:
-        import asyncio
-        await asyncio.gather(
-            client.get_players(),
-            client.get_nfl_state(),
-            return_exceptions=True,
-        )
-    except Exception:
-        pass
+    """Pre-load player DB and probe GQL so the circuit breaker opens before any user request."""
+    import asyncio
+    await asyncio.gather(
+        client.get_players(),
+        client.get_nfl_state(),
+        client.graphql("{ __typename }"),  # probe — opens circuit breaker if blocked
+        return_exceptions=True,
+    )
 
 
 def main():

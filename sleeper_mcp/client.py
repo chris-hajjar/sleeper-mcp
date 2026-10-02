@@ -15,6 +15,10 @@ GQL_URL = "https://api.sleeper.app/graphql"
 # Week stats cache: {"{season}_{week}": {player_id: stats_dict}}
 _week_stats_cache: dict = {}
 
+# GQL circuit breaker: if GQL fails, skip it for _GQL_RETRY_DELAY seconds
+_gql_failure_time: float = 0.0
+_GQL_RETRY_DELAY: float = 300.0  # 5 minutes
+
 
 class SleeperClient:
     def __init__(self, token: Optional[str] = None):
@@ -175,6 +179,10 @@ class SleeperClient:
     # ── GraphQL (internal Sleeper API) ────────────────────────────────────────
 
     async def graphql(self, query: str, variables: Optional[dict] = None) -> dict:
+        global _gql_failure_time
+        now = time.time()
+        if _gql_failure_time and (now - _gql_failure_time) < _GQL_RETRY_DELAY:
+            raise Exception("GQL circuit breaker open — skipping to REST fallback")
         headers = {
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -186,10 +194,15 @@ class SleeperClient:
         payload: dict = {"query": query}
         if variables:
             payload["variables"] = variables
-        async with httpx.AsyncClient(timeout=10) as http:
-            resp = await http.post(GQL_URL, json=payload, headers=headers)
-            resp.raise_for_status()
-            return resp.json()
+        try:
+            async with httpx.AsyncClient(timeout=10) as http:
+                resp = await http.post(GQL_URL, json=payload, headers=headers)
+                resp.raise_for_status()
+                _gql_failure_time = 0.0  # reset on success
+                return resp.json()
+        except Exception:
+            _gql_failure_time = time.time()  # open circuit breaker
+            raise
 
     async def get_week_player_stats(self, week: int, season: str = "2026") -> dict:
         """
