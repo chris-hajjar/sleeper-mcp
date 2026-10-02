@@ -273,17 +273,18 @@ async def get_my_season() -> str:
 async def get_matchup(week: Optional[int] = None) -> str:
     """
     Your matchup for a given week (defaults to current week).
-    Shows both teams' starters, scores, and matchup status.
+    Shows both teams' starters with per-player fantasy points and stats.
     """
     ctx = await _get_context()
-    cur_week, _ = await _current_week()
+    cur_week, season = await _current_week()
     if week is None:
         week = cur_week
 
-    roster_map, matchups, players = await _gather(
+    roster_map, matchups, players, league = await _gather(
         _build_roster_map(ctx["league_id"]),
         client.get_matchups(ctx["league_id"], week),
         client.get_players(),
+        client.get_league(ctx["league_id"]),
     )
 
     my = next((r for r in roster_map.values() if r["owner_id"] == ctx["user_id"]), None)
@@ -313,6 +314,38 @@ async def get_matchup(week: Optional[int] = None) -> str:
     my_starters = my_m.get("starters") or []
     opp_starters = (opp_m.get("starters") or []) if opp_m else []
 
+    # Per-player points: try exact player_map first (needs token), fall back to GQL weekly stats
+    player_pts: dict = {}
+    scoring_settings = league.get("scoring_settings") or {}
+    pts_field = client.scoring_type(scoring_settings)
+
+    if status != "UPCOMING":
+        all_starter_ids = [p for p in (my_starters + opp_starters) if p]
+        # Try matchup_legs (exact, requires token)
+        player_map_by_roster = await client.get_matchup_player_map(ctx["league_id"], week)
+        if player_map_by_roster:
+            for roster_player_map in player_map_by_roster.values():
+                player_pts.update(roster_player_map or {})
+        else:
+            # Fall back to GQL weekly_stats (no token needed, uses scoring type)
+            try:
+                week_stats = await client.get_stats_for_players(all_starter_ids, week, season)
+                for pid, stats in week_stats.items():
+                    player_pts[pid] = stats.get(pts_field, 0) or 0
+            except Exception:
+                pass
+
+    def fmt_starter(pid):
+        p = players.get(str(pid), {})
+        name = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip() or str(pid)
+        pos = p.get("position", "?")
+        team = p.get("team") or "FA"
+        injury = p.get("injury_status") or ""
+        injury_s = f" [{injury}]" if injury else ""
+        pts = player_pts.get(str(pid)) or player_pts.get(pid)
+        pts_s = f"  {pts:5.2f} pts" if pts is not None and status != "UPCOMING" else ""
+        return f"  {name} ({pos}, {team}){injury_s}{pts_s}"
+
     lines = [
         f"Week {week} Matchup  [{status}]",
         f"",
@@ -321,14 +354,17 @@ async def get_matchup(week: Optional[int] = None) -> str:
         f"  {opp.get('team_name', 'Opponent'):<28} {opp_pts:>7.2f} pts",
         "",
         "YOUR STARTERS:",
-        *[f"  {_fmt_player(pid, players)}" for pid in my_starters if pid],
+        *[fmt_starter(pid) for pid in my_starters if pid],
     ]
     if opp_m:
         lines += [
             "",
             "OPPONENT STARTERS:",
-            *[f"  {_fmt_player(pid, players)}" for pid in opp_starters if pid],
+            *[fmt_starter(pid) for pid in opp_starters if pid],
         ]
+    if player_pts and status != "UPCOMING":
+        src = "Sleeper scoring" if player_map_by_roster else pts_field.replace("pts_", "").upper() + " scoring"
+        lines.append(f"\n(Points source: {src})")
     return "\n".join(lines)
 
 
@@ -548,6 +584,198 @@ async def search_player(name: str) -> str:
             lines.append(f"  Depth: {p['depth_chart_position']} (#{p.get('depth_chart_order', '?')})")
         if p.get("injury_notes"):
             lines.append(f"  Notes: {p['injury_notes']}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_player_game_stats(name: str, week: Optional[int] = None) -> str:
+    """
+    Detailed stats and fantasy points for a specific player in a given week.
+    Shows rushing, receiving, passing yards, TDs, and pre-calculated PPR/std points.
+    week defaults to last completed week.
+    """
+    cur_week, season = await _current_week()
+    if week is None:
+        week = max(1, cur_week - 1)
+
+    players = await client.get_players()
+    result = _find_player(name, players)
+    if not result:
+        return f"Player '{name}' not found."
+
+    pid, p = result
+    full_name = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+    pos = p.get("position", "?")
+    team = p.get("team") or "FA"
+
+    stats_data = await client.get_stats_for_players([pid], week, season)
+    stats = stats_data.get(pid) or stats_data.get(str(pid)) or {}
+
+    if not stats:
+        return f"{full_name} ({pos}, {team}) — no stats found for Week {week}."
+
+    pts_ppr = stats.get("pts_ppr", 0) or 0
+    pts_std = stats.get("pts_std", 0) or 0
+    pts_half = stats.get("pts_half_ppr", 0) or 0
+    gp = int(stats.get("gp", 0) or 0)
+
+    lines = [
+        f"{full_name} ({pos}, {team}) — Week {week}, {season}",
+        f"Fantasy Points: {pts_ppr:.2f} PPR  |  {pts_half:.2f} Half  |  {pts_std:.2f} Std",
+        "=" * 44,
+    ]
+
+    if not gp:
+        lines.append("Did not play this week.")
+        return "\n".join(lines)
+
+    # Passing
+    pass_att = stats.get("pass_att", 0) or 0
+    if pass_att:
+        pass_cmp = stats.get("pass_cmp", 0) or 0
+        pass_yd = stats.get("pass_yd", 0) or 0
+        pass_td = int(stats.get("pass_td", 0) or 0)
+        pass_int = int(stats.get("pass_int", 0) or 0)
+        pass_lng = stats.get("pass_lng", 0) or 0
+        cmp_pct = stats.get("cmp_pct", 0) or 0
+        lines.append(f"Passing: {pass_cmp}/{pass_att} ({cmp_pct:.0f}%)  {pass_yd:.0f} yds  {pass_td} TD  {pass_int} INT  Long: {pass_lng:.0f}")
+
+    # Rushing
+    rush_att = stats.get("rush_att", 0) or 0
+    if rush_att:
+        rush_yd = stats.get("rush_yd", 0) or 0
+        rush_td = int(stats.get("rush_td", 0) or 0)
+        rush_lng = stats.get("rush_lng", 0) or 0
+        rush_ypa = stats.get("rush_ypa", 0) or 0
+        lines.append(f"Rushing: {rush_att:.0f} att  {rush_yd:.0f} yds  {rush_td} TD  Long: {rush_lng:.0f}  YPA: {rush_ypa:.1f}")
+
+    # Receiving
+    rec = stats.get("rec", 0) or 0
+    if rec or stats.get("rec_tgt", 0):
+        rec_tgt = stats.get("rec_tgt", 0) or 0
+        rec_yd = stats.get("rec_yd", 0) or 0
+        rec_td = int(stats.get("rec_td", 0) or 0)
+        rec_lng = stats.get("rec_lng", 0) or 0
+        rec_ypr = stats.get("rec_ypr", 0) or 0
+        lines.append(f"Receiving: {rec:.0f} rec / {rec_tgt:.0f} tgt  {rec_yd:.0f} yds  {rec_td} TD  Long: {rec_lng:.0f}  YPR: {rec_ypr:.1f}")
+
+    # Defense (DST)
+    sack = stats.get("sack", 0) or 0
+    if sack or stats.get("def_td", 0) or stats.get("pts_allow", 0):
+        def_td = int(stats.get("def_td", 0) or 0)
+        int_td = int(stats.get("int_td", 0) or 0)
+        fum_rec = int(stats.get("fum_rec", 0) or 0)
+        safe = int(stats.get("safe", 0) or 0)
+        pts_allow = stats.get("pts_allow", 0) or 0
+        yds_allow = stats.get("yds_allow", 0) or 0
+        lines.append(f"Defense: {sack:.0f} sacks  {def_td + int_td} TD  {fum_rec} FR  {safe} saf  {pts_allow:.0f} pts allowed  {yds_allow:.0f} yds allowed")
+
+    # Kicker
+    fgm = stats.get("fgm", 0) or 0
+    if fgm or stats.get("fga", 0):
+        fga = stats.get("fga", 0) or 0
+        fgm_lng = stats.get("fgm_lng", 0) or 0
+        xpm = stats.get("xpm", 0) or 0
+        xpa = stats.get("xpa", 0) or 0
+        lines.append(f"Kicking: {fgm:.0f}/{fga:.0f} FG  Long: {fgm_lng:.0f}  {xpm:.0f}/{xpa:.0f} XP")
+
+    # Snap count
+    off_snp = stats.get("off_snp", 0) or 0
+    tm_snp = stats.get("tm_off_snp", 0) or 0
+    if off_snp and tm_snp:
+        snp_pct = (off_snp / tm_snp * 100) if tm_snp else 0
+        lines.append(f"Snaps: {int(off_snp)}/{int(tm_snp)} ({snp_pct:.0f}%)")
+
+    # Bonuses
+    bonus_keys = [k for k in stats if k.startswith("bonus_")]
+    if bonus_keys:
+        bonuses = [f"{k.replace('bonus_', '')}: {stats[k]:.0f}" for k in bonus_keys]
+        lines.append(f"Bonuses: {', '.join(bonuses)}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_player_season_stats(name: str) -> str:
+    """
+    Season-to-date stats and fantasy points for any player.
+    Shows cumulative rushing, receiving, passing stats and scoring rank.
+    """
+    cur_week, season = await _current_week()
+    players = await client.get_players()
+    result = _find_player(name, players)
+    if not result:
+        return f"Player '{name}' not found."
+
+    pid, p = result
+    full_name = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+    pos = p.get("position", "?")
+    team = p.get("team") or "FA"
+
+    # Gather weekly stats for all completed weeks concurrently
+    import asyncio
+    completed_weeks = range(1, cur_week)
+    if not completed_weeks:
+        return f"No completed weeks yet."
+
+    weekly = await asyncio.gather(
+        *[client.get_stats_for_players([pid], w, season) for w in completed_weeks],
+        return_exceptions=True,
+    )
+
+    totals: dict = {}
+    games_played = 0
+    for week_data in weekly:
+        if isinstance(week_data, Exception):
+            continue
+        stats = week_data.get(pid) or week_data.get(str(pid)) or {}
+        if not stats:
+            continue
+        if stats.get("gp", 0):
+            games_played += 1
+        for k, v in stats.items():
+            if isinstance(v, (int, float)) and not k.startswith("pos_rank"):
+                totals[k] = totals.get(k, 0) + (v or 0)
+
+    if not totals:
+        return f"{full_name} — no stats found for {season} season."
+
+    pts_ppr = totals.get("pts_ppr", 0)
+    pts_std = totals.get("pts_std", 0)
+    pts_half = totals.get("pts_half_ppr", 0)
+    ppg_ppr = pts_ppr / games_played if games_played else 0
+
+    lines = [
+        f"{full_name} ({pos}, {team}) — {season} Season ({games_played} games)",
+        f"Fantasy Points: {pts_ppr:.2f} PPR  |  {pts_half:.2f} Half  |  {pts_std:.2f} Std",
+        f"PPR per game: {ppg_ppr:.2f}",
+        "=" * 44,
+    ]
+
+    pass_att = totals.get("pass_att", 0)
+    if pass_att:
+        pass_cmp = totals.get("pass_cmp", 0)
+        pass_yd = totals.get("pass_yd", 0)
+        pass_td = int(totals.get("pass_td", 0))
+        pass_int = int(totals.get("pass_int", 0))
+        cmp_pct = (pass_cmp / pass_att * 100) if pass_att else 0
+        lines.append(f"Passing: {pass_cmp:.0f}/{pass_att:.0f} ({cmp_pct:.1f}%)  {pass_yd:.0f} yds  {pass_td} TD  {pass_int} INT")
+
+    rush_att = totals.get("rush_att", 0)
+    if rush_att:
+        rush_yd = totals.get("rush_yd", 0)
+        rush_td = int(totals.get("rush_td", 0))
+        rush_ypa = rush_yd / rush_att if rush_att else 0
+        lines.append(f"Rushing: {rush_att:.0f} att  {rush_yd:.0f} yds  {rush_td} TD  YPA: {rush_ypa:.1f}")
+
+    rec = totals.get("rec", 0)
+    if rec or totals.get("rec_tgt", 0):
+        rec_tgt = totals.get("rec_tgt", 0)
+        rec_yd = totals.get("rec_yd", 0)
+        rec_td = int(totals.get("rec_td", 0))
+        rec_ypr = rec_yd / rec if rec else 0
+        lines.append(f"Receiving: {rec:.0f} rec / {rec_tgt:.0f} tgt  {rec_yd:.0f} yds  {rec_td} TD  YPR: {rec_ypr:.1f}")
 
     return "\n".join(lines)
 

@@ -10,6 +10,10 @@ PLAYERS_CACHE = CACHE_DIR / "players.json"
 PLAYERS_CACHE_TTL = 86400  # 24 hours
 
 BASE_URL = "https://api.sleeper.app/v1"
+GQL_URL = "https://api.sleeper.app/graphql"
+
+# Week stats cache: {"{season}_{week}": {player_id: stats_dict}}
+_week_stats_cache: dict = {}
 
 
 class SleeperClient:
@@ -144,3 +148,112 @@ class SleeperClient:
         if positions:
             params["position[]"] = positions
         return await self.get(f"/projections/nfl/player/{week}", params=params)
+
+    # ── GraphQL (internal Sleeper API) ────────────────────────────────────────
+
+    async def graphql(self, query: str, variables: Optional[dict] = None) -> dict:
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        payload: dict = {"query": query}
+        if variables:
+            payload["variables"] = variables
+        async with httpx.AsyncClient(timeout=30) as http:
+            resp = await http.post(GQL_URL, json=payload, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def get_week_player_stats(self, week: int, season: str = "2026") -> dict:
+        """
+        Returns {player_id: stats_dict} for all players in a week.
+        Includes pre-calculated pts_ppr, pts_std, pts_half_ppr.
+        Uses in-memory cache (cleared on new week).
+        """
+        cache_key = f"{season}_{week}"
+        if cache_key in _week_stats_cache:
+            return _week_stats_cache[cache_key]
+
+        result = await self.graphql("""
+        query WeeklyStats($season: String!, $week: Int!, $season_type: String!) {
+          weekly_stats(
+            sport: "nfl"
+            season: $season
+            season_type: $season_type
+            week: $week
+            category: "stat"
+            order_by: "pts_ppr"
+          ) {
+            player_id
+            stats
+            week
+          }
+        }
+        """, {"season": season, "week": week, "season_type": "regular"})
+
+        data = result.get("data") or {}
+        rows = data.get("weekly_stats") or []
+        by_player = {row["player_id"]: row.get("stats") or {} for row in rows}
+        _week_stats_cache[cache_key] = by_player
+        return by_player
+
+    async def get_stats_for_players(
+        self,
+        player_ids: list,
+        week: int,
+        season: str = "2026",
+    ) -> dict:
+        """
+        Returns {player_id: stats_dict} for a specific set of players in a week.
+        Faster than get_week_player_stats when you only need a few players.
+        """
+        ids_gql = json.dumps(player_ids)
+        result = await self.graphql(f"""
+        query {{
+          stats_for_players_in_week(
+            player_ids: {ids_gql}
+            week: {week}
+            season: "{season}"
+            season_type: "regular"
+            sport: "nfl"
+            category: "stat"
+          ) {{
+            player_id
+            stats
+          }}
+        }}
+        """)
+        data = result.get("data") or {}
+        rows = data.get("stats_for_players_in_week") or []
+        return {row["player_id"]: row.get("stats") or {} for row in rows}
+
+    async def get_matchup_player_map(self, league_id: str, week: int) -> dict:
+        """
+        Returns {roster_id: {player_id: fantasy_pts}} using Sleeper's internal
+        scoring engine (exact pts, includes bonus scoring).
+        Requires SLEEPER_TOKEN — falls back to None if unauthorized.
+        """
+        if not self.token:
+            return {}
+        result = await self.graphql("""
+        query MatchupLegs($league_id: String!, $round: Int!) {
+          matchup_legs(league_id: $league_id, round: $round) {
+            roster_id
+            matchup_id
+            points
+            proj_points
+            starters
+            player_map
+          }
+        }
+        """, {"league_id": league_id, "round": week})
+        data = result.get("data") or {}
+        legs = data.get("matchup_legs") or []
+        return {leg["roster_id"]: leg.get("player_map") or {} for leg in legs}
+
+    def scoring_type(self, scoring_settings: dict) -> str:
+        rec = scoring_settings.get("rec", 0)
+        if rec >= 1.0:
+            return "pts_ppr"
+        elif rec >= 0.5:
+            return "pts_half_ppr"
+        return "pts_std"

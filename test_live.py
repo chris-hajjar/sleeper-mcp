@@ -102,6 +102,15 @@ async def main():
     results.append(await test("get_draft_recap", get_draft_recap()))
     results.append(await test("get_my_season", get_my_season()))
 
+    print("\n── GQL Stats Tools ──")
+    from sleeper_mcp.server import get_player_game_stats, get_player_season_stats
+
+    results.append(await test("GQL week stats (all players)", client.get_week_player_stats(3, "2026")))
+    results.append(await test("GQL stats for players", client.get_stats_for_players(["4046", "2133", "5012"], 3, "2026")))
+    results.append(await test("get_matchup with per-player pts", get_matchup(3)))
+    results.append(await test("get_player_game_stats (Brock Purdy wk3)", get_player_game_stats("Brock Purdy", 3)))
+    results.append(await test("get_player_season_stats (McCaffrey)", get_player_season_stats("Christian McCaffrey")))
+
     passed = sum(results)
     total = len(results)
     print(f"\n{'=' * 40}")
