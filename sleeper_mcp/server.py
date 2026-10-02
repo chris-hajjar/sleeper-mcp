@@ -974,7 +974,12 @@ async def get_draft_recap() -> str:
 
 
 def main():
-    mcp.run()
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    if transport == "http":
+        port = int(os.getenv("PORT", "8000"))
+        mcp.run(transport="http", host="0.0.0.0", port=port)
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,5 @@
+[phases.install]
+cmds = ["pip install -e ."]
+
+[start]
+cmd = "python -m sleeper_mcp.server"
