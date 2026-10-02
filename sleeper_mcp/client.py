@@ -152,11 +152,14 @@ class SleeperClient:
     # ── REST stats map (public, no auth needed) ───────────────────────────────
 
     async def get_player_stats_map(self, week: int, season: str = "2026") -> dict:
-        """
-        Returns {player_id: stats_dict} for a week. Delegates to GQL weekly_stats
-        (the REST per-player endpoint returns empty dicts for 2026).
-        """
-        return await self.get_week_player_stats(week, season)
+        """REST-only weekly stats map. Returns empty dicts for 2026 but avoids GQL recursion."""
+        try:
+            raw = await self.get_player_stats(week, season)
+            if isinstance(raw, dict):
+                return {str(k): v for k, v in raw.items() if v}
+            return {}
+        except Exception:
+            return {}
 
     async def get_season_stats_map(self, season: str = "2026") -> dict:
         """Returns {player_id: stats_dict} for season totals via REST."""
@@ -183,7 +186,7 @@ class SleeperClient:
         payload: dict = {"query": query}
         if variables:
             payload["variables"] = variables
-        async with httpx.AsyncClient(timeout=30) as http:
+        async with httpx.AsyncClient(timeout=10) as http:
             resp = await http.post(GQL_URL, json=payload, headers=headers)
             resp.raise_for_status()
             return resp.json()
@@ -312,21 +315,24 @@ class SleeperClient:
         """
         if not self.token:
             return {}
-        result = await self.graphql("""
-        query MatchupLegs($league_id: String!, $round: Int!) {
-          matchup_legs(league_id: $league_id, round: $round) {
-            roster_id
-            matchup_id
-            points
-            proj_points
-            starters
-            player_map
-          }
-        }
-        """, {"league_id": league_id, "round": week})
-        data = result.get("data") or {}
-        legs = data.get("matchup_legs") or []
-        return {leg["roster_id"]: leg.get("player_map") or {} for leg in legs}
+        try:
+            result = await self.graphql("""
+            query MatchupLegs($league_id: String!, $round: Int!) {
+              matchup_legs(league_id: $league_id, round: $round) {
+                roster_id
+                matchup_id
+                points
+                proj_points
+                starters
+                player_map
+              }
+            }
+            """, {"league_id": league_id, "round": week})
+            data = result.get("data") or {}
+            legs = data.get("matchup_legs") or []
+            return {leg["roster_id"]: leg.get("player_map") or {} for leg in legs}
+        except Exception:
+            return {}
 
     def scoring_type(self, scoring_settings: dict) -> str:
         rec = scoring_settings.get("rec", 0)
