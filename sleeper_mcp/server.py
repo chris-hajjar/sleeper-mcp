@@ -1198,6 +1198,720 @@ async def get_draft_recap() -> str:
     return "\n".join(lines)
 
 
+# ── Player news & outlook ─────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def get_player_news(name: str) -> str:
+    """
+    Recent news, injury updates, game recaps, and season outlook for any player.
+    Pulls the last several news items plus a long-form analyst outlook.
+    """
+    players = await client.get_players()
+    result = _find_player(name, players)
+    if not result:
+        return f"Player '{name}' not found."
+
+    pid, p = result
+    full_name = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+    pos = p.get("position", "?")
+    team = p.get("team") or "FA"
+
+    news_items, outlook = await _gather(
+        client.get_player_news_gql(pid),
+        client.get_player_outlook_gql(pid),
+    )
+
+    lines = [f"{full_name} ({pos}, {team})", "=" * 44]
+
+    injury = p.get("injury_status", "")
+    notes = p.get("injury_notes", "")
+    if injury:
+        lines.append(f"Status: {injury}" + (f" — {notes}" if notes else ""))
+    lines.append("")
+
+    if outlook:
+        meta = outlook.get("metadata") or {}
+        analysis = meta.get("analysis") or meta.get("description") or ""
+        if analysis:
+            lines += ["SEASON OUTLOOK:", analysis[:600], ""]
+
+    if news_items:
+        lines.append("RECENT NEWS:")
+        for item in news_items:
+            meta = item.get("metadata") or {}
+            desc = meta.get("description") or ""
+            analysis = meta.get("analysis") or ""
+            source = item.get("source") or ""
+            pub = item.get("published") or ""
+            if pub:
+                try:
+                    from datetime import datetime
+                    ts = int(pub) / 1000
+                    pub = datetime.fromtimestamp(ts).strftime("%b %d")
+                except Exception:
+                    pass
+            lines.append(f"[{pub}] {source}")
+            if desc:
+                lines.append(f"  {desc[:200]}")
+            if analysis:
+                lines.append(f"  → {analysis[:150]}")
+            lines.append("")
+
+    if not news_items and not outlook:
+        lines.append("No recent news found.")
+
+    return "\n".join(lines)
+
+
+# ── Projections ───────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def get_player_stats_profile(name: str) -> str:
+    """
+    Full fantasy scoring profile for any player: season totals, per-game average,
+    and the last 2 weeks of actual stats. Use this for start/sit context.
+    """
+    cur_week, season = await _current_week()
+
+    players, season_map = await _gather(
+        client.get_players(),
+        client.get_season_stats_map(season),
+    )
+
+    result = _find_player(name, players)
+    if not result:
+        return f"Player '{name}' not found."
+
+    pid, p = result
+    full_name = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+    pos = p.get("position", "?")
+    team = p.get("team") or "FA"
+
+    s = season_map.get(str(pid)) or {}
+    pts_ppr = s.get("pts_ppr", 0) or 0
+    gp = int(s.get("gp", 0) or 0)
+    ppg = pts_ppr / gp if gp else 0
+
+    lines = [
+        f"{full_name} ({pos}, {team}) — {season} Season",
+        f"PPR Total: {pts_ppr:.2f}  |  {ppg:.2f}/game  ({gp} games)",
+        "=" * 44,
+    ]
+
+    injury = p.get("injury_status", "")
+    if injury:
+        lines.append(f"⚠ Status: {injury}")
+
+    if s.get("pass_att", 0):
+        pa = s.get("pass_att", 0); pc = s.get("pass_cmp", 0)
+        lines.append(f"Passing: {pc:.0f}/{pa:.0f}  {s.get('pass_yd', 0):.0f} yds  {int(s.get('pass_td', 0))} TD  {int(s.get('pass_int', 0))} INT")
+    if s.get("rush_att", 0):
+        lines.append(f"Rushing: {s.get('rush_att', 0):.0f} att  {s.get('rush_yd', 0):.0f} yds  {int(s.get('rush_td', 0))} TD")
+    if s.get("rec", 0) or s.get("rec_tgt", 0):
+        lines.append(f"Receiving: {s.get('rec', 0):.0f} rec / {s.get('rec_tgt', 0):.0f} tgt  {s.get('rec_yd', 0):.0f} yds  {int(s.get('rec_td', 0))} TD")
+
+    # Recent weeks via GQL
+    import asyncio
+    recent = [w for w in [cur_week - 1, cur_week - 2] if w >= 1]
+    if recent:
+        lines.append("")
+        recent_maps = await asyncio.gather(
+            *[client.get_week_player_stats(w, season) for w in recent],
+            return_exceptions=True,
+        )
+        for w, wmap in zip(recent, recent_maps):
+            if isinstance(wmap, Exception):
+                continue
+            ws = wmap.get(str(pid)) or {}
+            if ws.get("gp"):
+                lines.append(f"Week {w}: {ws.get('pts_ppr', 0):.2f} PPR")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_my_lineup_outlook(week: Optional[int] = None) -> str:
+    """
+    Your starters for a given week with season pts/game average and injury status.
+    Shows cumulative total and flags anyone who's questionable or out.
+    """
+    ctx = await _get_context()
+    cur_week, season = await _current_week()
+    if week is None:
+        week = cur_week
+
+    roster_map, matchups, players, season_map = await _gather(
+        _build_roster_map(ctx["league_id"]),
+        client.get_matchups(ctx["league_id"], week),
+        client.get_players(),
+        client.get_season_stats_map(season),
+    )
+
+    my = next((r for r in roster_map.values() if r["owner_id"] == ctx["user_id"]), None)
+    if not my:
+        return "Couldn't find your roster."
+
+    my_m = next((m for m in matchups if m["roster_id"] == my["roster_id"]), None)
+    starters = (my_m.get("starters") or []) if my_m else my["starters"]
+
+    lines = [f"Lineup Outlook — {my['team_name']}  Week {week}", "=" * 44]
+
+    for pid in starters:
+        if not pid:
+            lines.append("  [EMPTY SLOT]")
+            continue
+        p = players.get(str(pid), {})
+        name = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip() or str(pid)
+        pos = p.get("position", "?")
+        team = p.get("team") or "FA"
+        injury = p.get("injury_status", "")
+        inj_s = f" [{injury}]" if injury else ""
+        s = season_map.get(str(pid)) or {}
+        gp = int(s.get("gp", 0) or 0)
+        ppg = (s.get("pts_ppr", 0) or 0) / gp if gp else 0
+        ppg_s = f"  {ppg:.2f}/g" if gp else "  — (no games)"
+        lines.append(f"  {name} ({pos}, {team}){inj_s}{ppg_s}")
+
+    return "\n".join(lines)
+
+
+# ── Scoring leaders ───────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def get_scoring_leaders(
+    position: Optional[str] = None,
+    week: Optional[int] = None,
+    top: int = 15,
+) -> str:
+    """
+    Top fantasy scorers (PPR) for the season or a specific week.
+    position: QB | RB | WR | TE | K | DEF  (omit for all skill positions)
+    week: specific week number, or omit for season totals
+    """
+    cur_week, season = await _current_week()
+    players = await client.get_players()
+
+    if week:
+        # Use GQL weekly stats (REST weekly endpoint is empty for 2026)
+        week_map = await client.get_week_player_stats(week, season)
+        scored = [
+            (pid, s, players.get(str(pid), {}))
+            for pid, s in week_map.items()
+            if (s.get("pts_ppr") or 0) > 0
+        ]
+        if position:
+            scored = [(pid, s, p) for pid, s, p in scored if p.get("position", "") == position.upper()]
+        scored.sort(key=lambda x: x[1].get("pts_ppr", 0), reverse=True)
+        label = f"Week {week} Scoring Leaders"
+    else:
+        # Season totals via REST (works for 2026)
+        season_raw = await client.get_season_stats(season, order_by="pts_ppr")
+        season_map = {str(k): v for k, v in season_raw.items()} if isinstance(season_raw, dict) else {}
+        scored = [
+            (pid, s, players.get(str(pid), {}))
+            for pid, s in season_map.items()
+            if (s.get("pts_ppr") or 0) > 0
+        ]
+        if position:
+            scored = [(pid, s, p) for pid, s, p in scored if p.get("position", "") == position.upper()]
+        scored.sort(key=lambda x: x[1].get("pts_ppr", 0), reverse=True)
+        label = f"{season} Season Scoring Leaders"
+
+    if position:
+        label += f" — {position.upper()}"
+
+    lines = [label, "=" * 50]
+    for i, (pid, s, p) in enumerate(scored[:top], 1):
+        name = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip() or str(pid)
+        pos = p.get("position", "?")
+        team = p.get("team") or "?"
+        pts = s.get("pts_ppr", 0) or 0
+        gp = int(s.get("gp", 1) or 1)
+        ppg = pts / gp if gp else 0
+        ppg_s = f"  ({ppg:.1f}/g)" if not week else ""
+        lines.append(f"  {i:2}. {name} ({pos}, {team})  {pts:.2f}{ppg_s}")
+
+    return "\n".join(lines)
+
+
+# ── Start / Sit ───────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def get_start_sit(player1: str, player2: str, week: Optional[int] = None) -> str:
+    """
+    Compare two players for a start/sit decision.
+    Shows season pts/game average, last 2 weeks' actual scores, and injury status.
+    """
+    import asyncio
+
+    cur_week, season = await _current_week()
+    if week is None:
+        week = cur_week
+
+    players, season_map = await _gather(
+        client.get_players(),
+        client.get_season_stats_map(season),
+    )
+
+    r1 = _find_player(player1, players)
+    r2 = _find_player(player2, players)
+    if not r1:
+        return f"Player '{player1}' not found."
+    if not r2:
+        return f"Player '{player2}' not found."
+
+    recent_weeks = [w for w in [week - 1, week - 2] if w >= 1]
+    recent_maps = await asyncio.gather(
+        *[client.get_week_player_stats(w, season) for w in recent_weeks],
+        return_exceptions=True,
+    )
+
+    lines = [f"START / SIT — Week {week}", "=" * 44]
+    ppg_scores = {}
+
+    for label, (pid, p) in [("OPTION A", r1), ("OPTION B", r2)]:
+        name = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+        pos = p.get("position", "?")
+        team = p.get("team") or "FA"
+        injury = p.get("injury_status", "")
+
+        s = season_map.get(str(pid)) or {}
+        gp = int(s.get("gp", 0) or 0)
+        ppg = (s.get("pts_ppr", 0) or 0) / gp if gp else 0
+        ppg_scores[pid] = ppg
+
+        lines += [f"\n{label}: {name} ({pos}, {team})", f"  Season avg: {ppg:.2f} PPR/game ({gp} games)"]
+        if injury:
+            lines.append(f"  ⚠ Status: {injury}")
+
+        for w, wmap in zip(recent_weeks, recent_maps):
+            if isinstance(wmap, Exception):
+                continue
+            ws = wmap.get(str(pid)) or {}
+            if ws.get("gp"):
+                lines.append(f"  Week {w}: {ws.get('pts_ppr', 0):.2f} PPR")
+
+    p1_ppg = ppg_scores.get(r1[0], 0)
+    p2_ppg = ppg_scores.get(r2[0], 0)
+    p1_name = f"{r1[1].get('first_name', '')} {r1[1].get('last_name', '')}".strip()
+    p2_name = f"{r2[1].get('first_name', '')} {r2[1].get('last_name', '')}".strip()
+    better = p1_name if p1_ppg >= p2_ppg else p2_name
+    diff = abs(p1_ppg - p2_ppg)
+
+    lines += ["", f"SEASON AVG EDGE: {better} (+{diff:.2f}/g)", "Close call — weight matchup and recent news." if diff < 2 else ""]
+    return "\n".join(lines)
+
+
+# ── Free agents by projection ─────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def get_free_agents_by_stats(position: Optional[str] = None) -> str:
+    """
+    Available free agents ranked by season PPR points per game.
+    Better than trending — shows who's actually been scoring, not just who's popular.
+    position: QB | RB | WR | TE | K | DEF  (omit for all)
+    """
+    ctx = await _get_context()
+    cur_week, season = await _current_week()
+
+    rosters, players, season_map = await _gather(
+        client.get_rosters(ctx["league_id"]),
+        client.get_players(),
+        client.get_season_stats_map(season),
+    )
+
+    rostered: set = set()
+    for r in rosters:
+        rostered.update(r.get("players") or [])
+        rostered.update(r.get("reserve") or [])
+
+    positions = [position.upper()] if position else ["QB", "RB", "WR", "TE", "K", "DEF"]
+    label = f"FREE AGENTS BY SEASON SCORING" + (f" — {position.upper()}" if position else "")
+    lines = [label, "=" * 50]
+
+    for pos in positions:
+        available = []
+        for pid, p in players.items():
+            if pid in rostered:
+                continue
+            if (p.get("position") or "") != pos:
+                continue
+            if not p.get("team"):
+                continue
+            s = season_map.get(str(pid)) or {}
+            gp = int(s.get("gp", 0) or 0)
+            ppg = (s.get("pts_ppr", 0) or 0) / gp if gp else 0
+            available.append((pid, p, ppg, gp))
+
+        available.sort(key=lambda x: x[2], reverse=True)
+        top = [x for x in available if x[2] > 0][:10]
+        if not top:
+            continue
+
+        lines.append(f"\n{pos}:")
+        for pid, p, ppg, gp in top:
+            name = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+            team = p.get("team", "?")
+            injury = p.get("injury_status", "")
+            inj_s = f" [{injury}]" if injury else ""
+            lines.append(f"  {name} ({team}){inj_s}  {ppg:.2f}/g ({gp}gp)")
+
+    return "\n".join(lines)
+
+
+# ── Waiver wire activity ───────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def get_waiver_wire_activity(hours: int = 24) -> str:
+    """
+    Who's being added and dropped across all Sleeper leagues right now.
+    Shows both sides together so you can spot opportunity (drops) and consensus (adds).
+    """
+    adds_raw, drops_raw, players = await _gather(
+        client.get_trending(type_="add", hours=hours, limit=25),
+        client.get_trending(type_="drop", hours=hours, limit=25),
+        client.get_players(),
+    )
+
+    def fmt(item, type_):
+        pid = item.get("player_id", "")
+        count = item.get("count", 0)
+        p = players.get(str(pid), {})
+        name = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip() or str(pid)
+        pos = p.get("position", "?")
+        team = p.get("team") or "FA"
+        injury = p.get("injury_status", "")
+        inj_s = f" [{injury}]" if injury else ""
+        return f"  {name} ({pos}, {team}){inj_s}  —  {count:,} {type_}s"
+
+    lines = [
+        f"WAIVER WIRE ACTIVITY — last {hours}h",
+        "=" * 50,
+        "",
+        "TRENDING ADDS (pick up before everyone else does):",
+        *[fmt(x, "add") for x in adds_raw],
+        "",
+        "TRENDING DROPS (check if they're a buy-low target):",
+        *[fmt(x, "drop") for x in drops_raw],
+    ]
+    return "\n".join(lines)
+
+
+# ── All-play standings ────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def get_all_play_standings() -> str:
+    """
+    All-play standings: each team's record if they played every opponent every week.
+    Shows who's been lucky (good record vs weak schedule) vs unlucky (high scorer, bad luck).
+    """
+    import asyncio
+
+    ctx = await _get_context()
+    cur_week, _ = await _current_week()
+    roster_map = await _build_roster_map(ctx["league_id"])
+
+    completed_weeks = list(range(1, cur_week))
+    if not completed_weeks:
+        return "No completed weeks yet."
+
+    all_matchups = await asyncio.gather(
+        *[client.get_matchups(ctx["league_id"], w) for w in completed_weeks],
+        return_exceptions=True,
+    )
+
+    ap: dict = {rid: {"w": 0, "l": 0} for rid in roster_map}
+
+    for matchups in all_matchups:
+        if isinstance(matchups, Exception):
+            continue
+        week_scores = {m["roster_id"]: (m.get("points") or 0) for m in matchups}
+        for rid, pts in week_scores.items():
+            if rid not in ap:
+                continue
+            for opp_rid, opp_pts in week_scores.items():
+                if opp_rid == rid:
+                    continue
+                if pts > opp_pts:
+                    ap[rid]["w"] += 1
+                elif pts < opp_pts:
+                    ap[rid]["l"] += 1
+
+    standings = []
+    for rid, rec in ap.items():
+        t = roster_map.get(rid, {})
+        total_ap = rec["w"] + rec["l"]
+        win_rate = rec["w"] / total_ap if total_ap else 0
+        actual_games = t["wins"] + t["losses"]
+        expected_wins = round(win_rate * actual_games)
+        luck = t["wins"] - expected_wins
+        standings.append((rid, t, rec, luck))
+
+    standings.sort(key=lambda x: (x[2]["w"], x[1].get("fpts", 0)), reverse=True)
+
+    lines = [
+        "ALL-PLAY STANDINGS  (if you played every team each week)",
+        "=" * 56,
+    ]
+    for rid, t, rec, luck in standings:
+        actual = f"{t['wins']}-{t['losses']}"
+        ap_rec = f"{rec['w']}-{rec['l']}"
+        luck_s = f"  lucky +{luck}" if luck > 0 else (f"  unlucky {luck}" if luck < 0 else "")
+        lines.append(f"  {t.get('team_name', '?'):<26} AP: {ap_rec:<8} Real: {actual}{luck_s}")
+
+    return "\n".join(lines)
+
+
+# ── Power rankings ─────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def get_power_rankings() -> str:
+    """
+    Power rankings based on recent scoring (last 3 weeks, most recent weighted highest).
+    Shows who's hot vs cooling off regardless of their actual record.
+    """
+    import asyncio
+
+    ctx = await _get_context()
+    cur_week, _ = await _current_week()
+    roster_map = await _build_roster_map(ctx["league_id"])
+
+    last = cur_week - 1
+    week_weights = [(last, 3), (last - 1, 2), (last - 2, 1)]
+    weeks_to_fetch = [(w, wt) for w, wt in week_weights if w >= 1]
+
+    if not weeks_to_fetch:
+        return "Not enough completed weeks for power rankings."
+
+    results = await asyncio.gather(
+        *[client.get_matchups(ctx["league_id"], w) for w, _ in weeks_to_fetch],
+        return_exceptions=True,
+    )
+
+    weighted: dict = {rid: 0.0 for rid in roster_map}
+    total_wt: dict = {rid: 0 for rid in roster_map}
+
+    for (w, wt), matchups in zip(weeks_to_fetch, results):
+        if isinstance(matchups, Exception):
+            continue
+        for m in matchups:
+            rid = m.get("roster_id")
+            if rid in weighted:
+                weighted[rid] += (m.get("points") or 0) * wt
+                total_wt[rid] += wt
+
+    rankings = []
+    for rid, t in roster_map.items():
+        score = weighted[rid] / total_wt[rid] if total_wt[rid] else 0
+        standings_rank = sorted(
+            roster_map.values(), key=lambda r: (r["wins"], r["fpts"]), reverse=True
+        ).index(t) + 1
+        rankings.append((rid, t, score, standings_rank))
+
+    rankings.sort(key=lambda x: x[2], reverse=True)
+
+    lines = [
+        "POWER RANKINGS  (weighted: last wk ×3, 2 wks ×2, 3 wks ×1)",
+        "=" * 56,
+    ]
+    for pr_rank, (rid, t, score, stand_rank) in enumerate(rankings, 1):
+        rec = f"{t['wins']}-{t['losses']}"
+        move = stand_rank - pr_rank
+        move_s = f"  ↑{move}" if move > 0 else (f"  ↓{abs(move)}" if move < 0 else "  →")
+        lines.append(f"  {pr_rank:2}. {t.get('team_name', '?'):<26} {rec:<6} {score:.1f} pts{move_s} vs standings")
+
+    return "\n".join(lines)
+
+
+# ── Injury report ─────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def get_injury_report() -> str:
+    """
+    All rostered players currently listed as Q / D / O / IR / SUS, grouped by NFL team.
+    Run this before setting your lineup.
+    """
+    ctx = await _get_context()
+    rosters, players = await _gather(
+        client.get_rosters(ctx["league_id"]),
+        client.get_players(),
+    )
+
+    all_rostered: set = set()
+    for r in rosters:
+        all_rostered.update(r.get("players") or [])
+        all_rostered.update(r.get("reserve") or [])
+
+    STATUS_RANK = {"O": 0, "D": 1, "Q": 2, "IR": 3, "PUP": 4, "SUS": 5}
+
+    by_team: dict = {}
+    for pid, p in players.items():
+        if pid not in all_rostered:
+            continue
+        injury = p.get("injury_status", "")
+        if not injury:
+            continue
+        team = p.get("team") or "FA"
+        by_team.setdefault(team, []).append((pid, p, injury))
+
+    for team in by_team:
+        by_team[team].sort(key=lambda x: STATUS_RANK.get(x[2], 9))
+
+    lines = ["INJURY REPORT — Rostered Players Only", "=" * 44]
+
+    if not by_team:
+        lines.append("No injuries flagged for rostered players.")
+        return "\n".join(lines)
+
+    for team in sorted(by_team.keys()):
+        lines.append(f"\n{team}:")
+        for pid, p, injury in by_team[team]:
+            name = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+            pos = p.get("position", "?")
+            notes = p.get("injury_notes", "")
+            notes_s = f" — {notes}" if notes else ""
+            lines.append(f"  [{injury}] {name} ({pos}){notes_s}")
+
+    return "\n".join(lines)
+
+
+# ── DST streamers ─────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def get_dst_streamers(week: Optional[int] = None) -> str:
+    """
+    Best available DSTs to stream this week.
+    Shows season stats (pts/g, sacks, pts allowed) plus the latest news on each
+    defense — news articles include upcoming opponent context.
+    """
+    import asyncio
+
+    ctx = await _get_context()
+    cur_week, season = await _current_week()
+    if week is None:
+        week = cur_week
+
+    rosters, players, season_stats_raw = await _gather(
+        client.get_rosters(ctx["league_id"]),
+        client.get_players(),
+        client.get_season_stats(season, positions=["DEF"]),
+    )
+
+    # Season stats endpoint returns {player_id: stats_dict}
+    stats_map = {str(k): v for k, v in season_stats_raw.items()} if isinstance(season_stats_raw, dict) else {}
+
+    rostered: set = set()
+    for r in rosters:
+        rostered.update(r.get("players") or [])
+
+    available = []
+    for pid, p in players.items():
+        if pid in rostered:
+            continue
+        if p.get("position") != "DEF":
+            continue
+        if not p.get("team"):
+            continue
+        stats = stats_map.get(str(pid)) or {}
+        gp = int(stats.get("gp", 0) or 0)
+        ppg = (stats.get("pts_ppr", 0) or 0) / gp if gp else 0
+        available.append((pid, p, ppg, stats))
+
+    available.sort(key=lambda x: x[2], reverse=True)
+    top = available[:8]
+
+    if not top:
+        return "No DSTs available on waivers."
+
+    # Fetch news for each DST in parallel (news mentions upcoming opponent)
+    news_list = await asyncio.gather(
+        *[client.get_player_news_gql(pid, limit=1) for pid, *_ in top],
+        return_exceptions=True,
+    )
+
+    lines = [f"DST STREAMERS — Week {week}", "=" * 50]
+
+    for (pid, p, ppg, stats), news in zip(top, news_list):
+        name = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip() or p.get("team", "?")
+        team = p.get("team", "?")
+        gp = int(stats.get("gp", 0) or 0)
+        sacks = stats.get("sack", 0) or 0
+        pts_allow = stats.get("pts_allow", 0) or 0
+
+        lines.append(f"\n{name} ({team})")
+        lines.append(f"  Season: {ppg:.1f} PPR/g  |  {sacks:.0f} sacks  |  {pts_allow:.0f} pts allowed  ({gp}gp)")
+
+        if isinstance(news, list) and news:
+            meta = (news[0].get("metadata") or {})
+            analysis = meta.get("analysis") or meta.get("description") or ""
+            if analysis:
+                lines.append(f"  {analysis[:180]}")
+
+    return "\n".join(lines)
+
+
+# ── Playoff bracket ───────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def get_playoff_bracket() -> str:
+    """
+    Current playoff bracket with results and upcoming matchups.
+    Only shows useful data once playoffs have started.
+    """
+    ctx = await _get_context()
+    roster_map, bracket, league = await _gather(
+        _build_roster_map(ctx["league_id"]),
+        client.get_winners_bracket(ctx["league_id"]),
+        client.get_league(ctx["league_id"]),
+    )
+
+    settings = league.get("settings") or {}
+    playoff_start = settings.get("playoff_week_start", 15)
+    cur_week, _ = await _current_week()
+
+    if cur_week < playoff_start:
+        return f"Playoffs start Week {playoff_start} — {playoff_start - cur_week} weeks away."
+
+    if not bracket:
+        return "No playoff bracket data available yet."
+
+    def team_name(rid):
+        if rid is None:
+            return "TBD"
+        return roster_map.get(rid, {}).get("team_name", f"Team {rid}")
+
+    by_round: dict = {}
+    for match in bracket:
+        r = match.get("r", 0)
+        by_round.setdefault(r, []).append(match)
+
+    lines = ["PLAYOFF BRACKET", "=" * 44]
+    for r in sorted(by_round.keys()):
+        round_week = playoff_start + r - 1
+        lines.append(f"\nRound {r}  (Week {round_week}):")
+        for m in by_round[r]:
+            t1 = team_name(m.get("t1"))
+            t2 = team_name(m.get("t2"))
+            winner = m.get("w")
+            if winner:
+                lines.append(f"  {team_name(winner)} def. {team_name(m.get('l'))}")
+            else:
+                lines.append(f"  {t1} vs {t2}")
+
+    return "\n".join(lines)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 
