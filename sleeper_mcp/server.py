@@ -158,6 +158,7 @@ async def set_context(username: str, league_id: Optional[str] = None) -> str:
 @mcp.tool()
 async def get_context_info() -> str:
     """Show the currently configured Sleeper user and league."""
+    import traceback
     try:
         ctx = await _get_context()
         league = await client.get_league(ctx["league_id"])
@@ -168,8 +169,8 @@ async def get_context_info() -> str:
             f"Season: {league.get('season')} | Status: {league.get('status')}\n"
             f"Teams: {league.get('total_rosters')}"
         )
-    except ValueError as e:
-        return str(e)
+    except Exception as e:
+        return f"Error: {e}\n\nTraceback:\n{traceback.format_exc()}"
 
 
 # ── My team ───────────────────────────────────────────────────────────────────
